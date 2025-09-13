@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ====== ENV ======
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 
@@ -13,8 +14,13 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 WEBHOOK_1 = os.getenv("WEBHOOK_1", "").strip()
 WEBHOOK_2 = os.getenv("WEBHOOK_2", "").strip()
 
-# Notional (Margin ohne Hebel) an den Trading-Server mitgeben
-DEFAULT_NOTIONAL = float(os.getenv("NOTIONAL", os.getenv("DEFAULT_NOTIONAL", "50")))
+# Notional (Margin ohne Hebel) – wird an den Trading-Server mitgegeben
+# Alias: erlaubt FORWARDER_NOTIONAL ODER (zur Abwärtskompatibilität) NOTIONAL/DEFAULT_NOTIONAL
+FORWARDER_NOTIONAL = float(
+    os.getenv("FORWARDER_NOTIONAL",
+              os.getenv("NOTIONAL",
+                        os.getenv("DEFAULT_NOTIONAL", "50")))
+)
 
 # Polling-Takt
 POLL_BASE   = int(os.getenv("POLL_BASE_SECONDS", "300"))   # 5 min
@@ -33,7 +39,7 @@ HEADERS = {
                    "Chrome/126.0 Safari/537.36"),
 }
 
-# ---------- Utils ----------
+# ====== Utils ======
 
 def load_state():
     if STATE_FILE.exists():
@@ -69,16 +75,19 @@ def _first_block(text: str) -> str:
     parts = re.split(r"\n\s*\n", text.strip())
     return parts[0].strip() if parts else text.strip()
 
-def _extract_timeframe_from_text(t: str) -> str | None:
+def _extract_timeframe_line(t: str) -> str | None:
+    """
+    Liefert die KOMPLETTE TF-Zeile ('Timeframe: XYZ'), falls vorhanden.
+    """
     m = re.search(r"Timeframe:\s*([A-Za-z0-9]+)", t, re.I)
-    return m.group(0).strip() if m else None  # komplette "Timeframe: XYZ"-Zeile
+    return m.group(0).strip() if m else None
 
 def build_signal_text_from_msg(msg: dict) -> str:
     """
-    Baut den finalen Signaltext:
-      - Embed: nimmt embeds[0].description (nur erster Block) + embeds[0].footer.text (Timeframe)
-      - Fallback: content (nur erster Block) + evtl. TF aus content oder embed-footer
-      - Garantiert, dass am Ende genau EINE Timeframe-Zeile steht
+    Baut den finalen Signaltext für den Trading-Server:
+      - priorisiert embed.description (erster Block), sonst content (erster Block)
+      - hängt die 'Timeframe: XYZ'-Zeile ans Ende, falls nicht bereits im Block vorhanden
+      - garantiert: am Ende genau EINE Timeframe-Zeile (wenn überhaupt vorhanden)
     """
     content = (msg.get("content") or "").strip()
     embeds  = msg.get("embeds") or []
@@ -89,38 +98,28 @@ def build_signal_text_from_msg(msg: dict) -> str:
     if embeds and isinstance(embeds, list):
         e0 = embeds[0] or {}
         desc = (e0.get("description") or "").strip()
-        # Discord embed footer kann als obj oder dict vorliegen
+        # footer kann als dict kommen
         footer = e0.get("footer") or {}
-        if isinstance(footer, dict):
-            footer_txt = (footer.get("text") or "").strip()
-        else:
-            footer_txt = ""
-        # komplette "Timeframe: XYZ"-Zeile extrahieren, nicht nur Wert
+        footer_txt = (footer.get("text") or "").strip() if isinstance(footer, dict) else ""
         if footer_txt:
-            ft = _extract_timeframe_from_text(footer_txt)
-            if ft:
-                footer_tf_line = ft
+            footer_tf_line = _extract_timeframe_line(footer_txt)
 
-    # Quelltext für den ersten Block: bevorzugt embed.description, sonst content
-    base_text = desc if desc else content
-    base_text = _first_block(base_text)
+    # Basistext = erster Block aus embed.description, sonst content
+    base_text = _first_block(desc if desc else content)
 
     # Hat der Base-Block schon eine TF-Zeile?
-    tf_inline = _extract_timeframe_from_text(base_text)
+    tf_inline = _extract_timeframe_line(base_text)
 
-    # Falls nicht, TF aus content/footer suchen
     if not tf_inline:
-        tf_from_content = _extract_timeframe_from_text(content) if content else None
+        # Versuche TF aus content oder footer zu holen
+        tf_from_content = _extract_timeframe_line(content) if content else None
         tf_line = tf_from_content or footer_tf_line
         if tf_line:
-            # TF ans Ende hängen
             final_text = base_text.rstrip() + "\n" + tf_line
         else:
-            # keine TF gefunden -> trotzdem base_text zurück (Server filtert ggf. raus)
-            final_text = base_text
+            final_text = base_text  # ggf. filtert der Server dann raus
     else:
-        # Es gibt bereits eine TF-Zeile im Block – sicherstellen, dass sie am Ende steht.
-        # Schneide evtl. nachfolgende Zeilen ab und hänge nur die TF als letzte Zeile an.
+        # Stelle sicher, dass TF als LETZTE Zeile steht (doppelte TF vermeiden)
         block_ohne_tf = re.sub(r"\n?Timeframe:\s*[A-Za-z0-9]+\s*$", "", base_text, flags=re.I).rstrip()
         final_text = block_ohne_tf + "\n" + tf_inline
 
@@ -128,8 +127,7 @@ def build_signal_text_from_msg(msg: dict) -> str:
 
 def forward_to_webhooks(msg):
     """
-    Sendet NICHT mehr die Roh-Payload, sondern genau den Signaltext + notional,
-    so wie es der FastAPI-Server erwartet.
+    Sendet genau { "text": "...Signal...", "notional": <FORWARDER_NOTIONAL> }.
     """
     text = build_signal_text_from_msg(msg)
     if not text:
@@ -138,7 +136,7 @@ def forward_to_webhooks(msg):
 
     payload = {
         "text": text,
-        "notional": DEFAULT_NOTIONAL
+        "notional": FORWARDER_NOTIONAL
     }
 
     urls = [WEBHOOK_1] + ([WEBHOOK_2] if WEBHOOK_2 else [])
@@ -146,7 +144,7 @@ def forward_to_webhooks(msg):
         try:
             r = requests.post(url, json=payload, timeout=20)
             r.raise_for_status()
-            print(f"[→ Webhook{idx}] OK | text[:80]={text[:80]!r}")
+            print(f"[→ Webhook{idx}] OK | text[:80]={text[:80]!r} | notional={FORWARDER_NOTIONAL}")
         except Exception as ex:
             print(f"[→ Webhook{idx}] FAIL: {ex}")
 
@@ -163,11 +161,11 @@ def sleep_until_next_tick():
     sleep_s = max(0, next_tick - now)
     time.sleep(sleep_s)
 
-# ---------- Main Loop ----------
+# ====== Main Loop ======
 
 def main():
     print(f"Getaktet: alle {POLL_BASE}s, jeweils +{POLL_OFFSET}s Offset (z. B. 10:00:05, 10:05:05, …)")
-    print(f"➡️  Notional (pro Trade, ohne Hebel): {DEFAULT_NOTIONAL}")
+    print(f"➡️  Forwarder-Notional (pro Trade, ohne Hebel): {FORWARDER_NOTIONAL}")
     state = load_state()
     last_id = state.get("last_id")
 
